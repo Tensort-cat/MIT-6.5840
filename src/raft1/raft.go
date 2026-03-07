@@ -55,6 +55,8 @@ type Raft struct {
 	role string // "follower", "candidate", or "leader"
 
 	lastHeartbeat time.Time // 上次收到心跳的时间
+
+	applyCh chan raftapi.ApplyMsg // 用于向服务或测试器发送 ApplyMsg 消息的通道
 }
 
 type LogEntry struct {
@@ -89,23 +91,66 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	rf.lastHeartbeat = time.Now() // 更新上次收到心跳的时间
-
-	// Reply false if term < currentTerm
-	if args.Term < rf.currentTerm {
-		return
-	}
-
+	// 当 follower 和 candidate 收到任期号比自己大的 AppendEntries RPC 时，说明自己过时了，转变为 FOLLOWER
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = FOLLOWER
 	}
 
+	// candidate 收到 AppendEntries(term >= currentTerm) 会立即转 follower
 	if args.Term == rf.currentTerm && rf.role == CANDIDATE {
 		rf.role = FOLLOWER
 		rf.votedFor = -1
 	}
 
+	// Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	// 在日志中没有包含一个索引为 prevLogIndex 且任期号为 prevLogTerm 的条目时，回复 false
+	if args.PrevLogIndex >= len(rf.log) { // prevLogIndex 可能超过了当前日志的长度
+		return
+	}
+
+	if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	// If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+	// 当一个已经存在的条目和一个新的条目发生冲突（索引相同但任期号不同）时，删除已经存在的条目和它之后的所有条目
+	offset := 0
+	for i, entry := range args.Entries {
+		index := args.PrevLogIndex + 1 + i
+		if index < len(rf.log) {
+			// 找到第一个冲突的条目，删除它和之后的所有条目
+			if rf.log[index].Term != entry.Term {
+				rf.log = rf.log[:index]
+				break
+			}
+			offset = i + 1
+		} else {
+			break
+		}
+	}
+
+	// Append any new entries not already in the log
+	// 将所有新的条目追加到日志中
+	for i := offset; i < len(args.Entries); i++ {
+		rf.log = append(rf.log, args.Entries[i])
+	}
+
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// 当 leaderCommit 大于 commitIndex 时，将 commitIndex 更新为 leaderCommit 和最后一个新条目的索引中的较小值
+	if args.LeaderCommit > rf.commitIndex {
+		lastIndex := len(rf.log) - 1
+		rf.commitIndex = min(args.LeaderCommit, lastIndex)
+		rf.applyEntries()
+	}
+
+	reply.Success = true
 	reply.Term = rf.currentTerm
 }
 
@@ -277,11 +322,27 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command any) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	// index := -1
+	// term := -1
+	// isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	isLeader := rf.role == LEADER
+
+	if !isLeader {
+		return -1, rf.currentTerm, isLeader
+	}
+
+	index := len(rf.log)
+	term := rf.currentTerm
+
+	rf.log = append(rf.log, LogEntry{
+		Command: command,
+		Term:    term,
+	})
 
 	return index, term, isLeader
 }
@@ -326,26 +387,48 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) sendHeartbeat(term int, commitIndex int) {
+func (rf *Raft) sendHeartbeat() {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 
 		go func(server int) {
+			rf.mu.Lock()
+			term := rf.currentTerm
+			prevLogIndex := rf.nextIndex[server] - 1
+			prevLogTerm := rf.log[prevLogIndex].Term
+			entries := rf.log[rf.nextIndex[server]:]
 			args := AppendEntriesArgs{
 				Term:         term,
 				LeaderId:     rf.me,
-				PrevLogIndex: -1,
-				PrevLogTerm:  0,
-				Entries:      nil,
-				LeaderCommit: commitIndex,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
 			}
+			rf.mu.Unlock()
+
 			reply := AppendEntriesReply{}
 			rf.sendAppendEntries(server, &args, &reply)
-
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			// 因为并发问题当前rf可能已经不是leader或者任期号已经改变了，需要检查
+			if rf.role != LEADER || term != rf.currentTerm {
+				return
+			}
+
+			// If successful: update nextIndex and matchIndex for follower
+			if reply.Success {
+				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			} else {
+				// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+				if reply.Term == rf.currentTerm {
+					rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+				}
+			}
+
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.role = FOLLOWER
@@ -368,7 +451,6 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me // 给自己投票
 	var votes int32 = 1 // 已经获得的选票数，初始值为 1（自己投的一票）
 	term := rf.currentTerm
-	commitIndex := rf.commitIndex
 	lastIndex, lastTerm := rf.lastLogIndexTerm()
 	rf.lastHeartbeat = time.Now()
 	rf.mu.Unlock()
@@ -413,12 +495,42 @@ func (rf *Raft) startElection() {
 				if newVotes > int32(len(rf.peers)/2) {
 					rf.role = LEADER
 					rf.lastHeartbeat = time.Now()
+
+					lastIndex := len(rf.log)
+					for i := range rf.peers {
+						rf.nextIndex[i] = lastIndex
+						rf.matchIndex[i] = 0
+					}
+
 					go rf.leaderLoop()
-					go rf.sendHeartbeat(term, commitIndex)
+					go rf.sendHeartbeat()
 				}
 			}
 
 		}(i)
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+	// 找到满足条件的最大的 N，将 commitIndex 更新为 N
+	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+		if rf.log[N].Term != rf.currentTerm {
+			continue
+		}
+		count := 1 // 包括 leader 自己
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = N
+			rf.applyEntries() // 提交新的日志条目
+			break
+		}
 	}
 }
 
@@ -430,10 +542,20 @@ func (rf *Raft) leaderLoop() {
 			rf.mu.Unlock()
 			return
 		}
-		term := rf.currentTerm
-		commitIndex := rf.commitIndex
 		rf.mu.Unlock()
-		rf.sendHeartbeat(term, commitIndex)
+		rf.sendHeartbeat()
+		rf.updateCommitIndex()
+	}
+}
+
+func (rf *Raft) applyEntries() {
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		rf.applyCh <- raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied,
+		}
 	}
 }
 
@@ -456,7 +578,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]LogEntry, 0)
+	rf.log = []LogEntry{{Term: 0}}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.role = FOLLOWER // 一开始都是 FOLLOWER
@@ -466,6 +588,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 
 	rf.lastHeartbeat = time.Now() // 初始化上次收到心跳的时间
+
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
